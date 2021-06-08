@@ -1,0 +1,130 @@
+import com.bmuschko.gradle.docker.tasks.container.DockerCreateContainer
+import com.bmuschko.gradle.docker.tasks.container.DockerRemoveContainer
+import com.bmuschko.gradle.docker.tasks.container.DockerStartContainer
+import com.bmuschko.gradle.docker.tasks.image.DockerPullImage
+import nu.studer.gradle.jooq.JooqEdition
+
+plugins {
+    id 'java'
+    id 'nu.studer.jooq' version '5.2.1'
+    id "org.flywaydb.flyway" version "7.9.2"
+    id 'com.bmuschko.docker-remote-api' version '7.0.0'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    jooqGenerator 'org.postgresql:postgresql:42.2.14'
+    implementation 'org.postgresql:postgresql:42.2.14'
+}
+
+flyway {
+    url = 'jdbc:postgresql://localhost:5532/postgres'
+    user = 'postgres'
+    password = 'postgres'
+    locations = ["filesystem:$projectDir/src/migration"]
+}
+
+jooq {
+    version = "3.14.11"
+    edition = JooqEdition.OSS
+    configurations {
+        main {
+            generationTool {
+                jdbc {
+                    driver = 'org.postgresql.Driver'
+                    url = 'jdbc:postgresql://localhost:5532/postgres'
+                    user = 'postgres'
+                    password = 'postgres'
+                }
+                generator {
+                    name = 'org.jooq.codegen.DefaultGenerator'
+                    database {
+                        name = 'org.jooq.meta.postgres.PostgresDatabase'
+                        excludes = 'fly.*'
+                        outputSchemaToDefault = true
+                        inputSchema = "custom_schema"
+                        tableValuedFunctions = true
+                    }
+                    target {
+                        packageName = "generated"
+                    }
+                    generate {
+                        records = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+tasks.configureEach {
+    if (it.name.startsWith("flyway") || it.name == "generateJooq") {
+        dependsOn "startPostgresContainer"
+        finalizedBy "stopPostgresContainer"
+    }
+}
+
+task pullPostgresImage(type: DockerPullImage) {
+    image = 'postgres:11.12'
+}
+
+task createPostgresContainer(type: DockerCreateContainer, dependsOn: pullPostgresImage) {
+    containerName = project.name
+    imageId = pullPostgresImage.image.get()
+    hostConfig.portBindings.add("5532:5432")
+    hostConfig.autoRemove = true
+    envVars.put("POSTGRES_PASSWORD", "postgres")
+    envVars.put("POSTGRES_DB", "postgres")
+
+    onError { e ->
+        if (e.class.simpleName in ['BadRequestException', 'ConflictException']) {
+            logger.warn 'Container already exists'
+        } else {
+            throw e
+        }
+    }
+
+}
+task startPostgresContainer(type: DockerStartContainer, dependsOn: createPostgresContainer) {
+    containerId = createPostgresContainer.containerName
+    onError { e ->
+        if (e.class.simpleName == 'NotModifiedException') {
+            logger.warn 'Container already started'
+        } else {
+            throw e
+        }
+    }
+    onComplete {
+        sleep 3000 // wait for startup
+        logger.info "Postgres is listening on port 5532"
+    }
+}
+
+task stopPostgresContainer(type: DockerRemoveContainer) {
+    containerId = createPostgresContainer.containerName
+    force = true
+    onError { e ->
+        if (e.class.simpleName == 'NotModifiedException') {
+            logger.warn 'Container already stopped'
+        } else {
+            throw e
+        }
+    }
+}
+
+tasks.generateJooq.dependsOn(tasks.flywayMigrate)
+
+task showSchemaReferences {
+    dependsOn "generateJooq"
+    doLast {
+        exec {
+            commandLine("grep", "-rn", "custom_schema", tasks.generateJooq.outputDir.get().asFile.absolutePath)
+            standardOutput(System.out)
+            errorOutput(System.err)
+            ignoreExitValue = true
+        }
+    }
+}
